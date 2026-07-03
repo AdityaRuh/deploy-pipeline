@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+safe-push-daemon — the background validation service.
+
+The push-and-keep-working architecture:
+
+    git push gate my-branch     <- returns INSTANTLY, you keep working
+            |
+            v
+    gate repo's post-receive hook writes a job to ~/.safe-push/queue/
+            |
+            v
+    this daemon picks it up, runs the full gate (worktree, tests, lint,
+    AI review) on the EXACT pushed commit, and only forwards it to
+    origin + opens the PR when everything is green.
+            |
+            v
+    you get a macOS notification with the verdict either way.
+
+Commands:
+    start     run in the background (survives closing the terminal)
+    stop      stop the background daemon
+    status    is it running? how many jobs are queued?
+    run       run in the foreground (Ctrl-C to stop) — good for watching
+    run-once  process the current queue once, then exit — good for testing
+    review    approve/reject fixes the gate parked for human judgment
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home() / ".safe-push"
+QUEUE = HOME / "queue"
+DONE = HOME / "done"
+PIDFILE = HOME / "daemon.pid"
+LOGFILE = HOME / "daemon.log"
+
+
+def log(message):
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def notify(message):
+    safe = message.replace('"', "").replace("'", "")
+    subprocess.run(["osascript", "-e",
+                    f'display notification "{safe}" with title "safe-push daemon"'],
+                   capture_output=True)
+
+
+def process_job(job_file):
+    # Atomic claim: rename before processing. If two daemons race for the
+    # same job, the rename succeeds for exactly one of them (learned the
+    # hard way — a stale daemon and a run-once once processed one job twice).
+    claimed = job_file.with_suffix(".processing")
+    try:
+        job_file.rename(claimed)
+    except FileNotFoundError:
+        return  # another worker claimed it first
+    job_file = claimed
+
+    try:
+        job = json.loads(job_file.read_text())
+        repo, branch, sha = job["repo"], job["branch"], job["sha"]
+    except (json.JSONDecodeError, KeyError):
+        log(f"skipping malformed job {job_file.name}")
+        job_file.rename(DONE / job_file.name)
+        return
+
+    log(f"⚙  validating '{branch}' ({sha[:10]}) in {repo}")
+    # The gate is an installed tool now, not a file in the target repo.
+    import shutil
+    gate = shutil.which("safe-push-final") or \
+        os.path.expanduser("~/.local/bin/safe-push-final")
+    try:
+        result = subprocess.run(
+            [sys.executable, gate, "--ref", sha, "--branch", branch, "--autofix"],
+            cwd=repo, capture_output=True, text=True, timeout=1800)
+        output = result.stdout + result.stderr
+        exit_code = result.returncode
+    except subprocess.TimeoutExpired:
+        output = "daemon: gate timed out after 30 minutes (failing closed)"
+        exit_code = 1
+
+    # Full transcript of every job is kept for replay.
+    (DONE / (job_file.name + ".log")).write_text(output)
+    job_file.unlink()
+
+    if exit_code == 0:
+        log(f"✅ '{branch}' green — forwarded to origin")
+        notify(f"{branch}: validated, forwarded to origin")
+    elif exit_code == 3:
+        # Fixes that affect code intent are waiting for the human.
+        log(f"🖐  '{branch}' paused — fixes await human approval")
+        notify(f"{branch}: fixes need your approval — run safe-push-daemon review")
+    else:
+        reason = output.strip().splitlines()[-1] if output.strip() else "unknown"
+        log(f"❌ '{branch}' BLOCKED — {reason}")
+        notify(f"{branch}: BLOCKED — see ~/.safe-push/done/")
+
+
+def run_loop(once=False):
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    DONE.mkdir(parents=True, exist_ok=True)
+    log(f"watching queue: {QUEUE}")
+    while True:
+        for job_file in sorted(QUEUE.glob("*.job")):
+            process_job(job_file)
+        if once:
+            log("queue empty — run-once finished")
+            return
+        time.sleep(2)
+
+
+# ---------------- human review of parked fixes ----------------
+def review():
+    """Show every parked fix, collect y/n, build the fixed commit, and
+    re-queue it for validation + forwarding. The human stays in charge."""
+    import difflib
+    PENDING = HOME / "pending"
+    records = sorted(PENDING.glob("*.json")) if PENDING.exists() else []
+    if not records:
+        print("No fixes are waiting for review.")
+        return
+
+    for record_file in records:
+        record = json.loads(record_file.read_text())
+        repo, branch, sha = record["repo"], record["branch"], record["sha"]
+        print(f"\n=== {branch} ({sha[:10]}) in {repo} ===")
+        approved = []
+        rejected_files = set()
+        for fix in record["fixes"]:
+            if fix["status"] == "auto":
+                # Whitespace-only: pre-approved by the harness, no human
+                # question needed — but it must be part of the fixed commit.
+                if "new_content" in fix:
+                    approved.append(fix)
+                print(f"• auto-applied (whitespace): {fix['finding']}")
+                continue
+            # Same-file fixes are chained (each built on the previous one),
+            # so rejecting one invalidates the ones after it in that file.
+            if fix["file"] in rejected_files:
+                print(f"\n— Skipped (an earlier fix to {fix['file']} was "
+                      f"rejected): {fix['finding']}")
+                continue
+            print(f"\n— Finding: {fix['finding']}")
+            print(f"  File: {fix['file']}")
+            print("  " + "-" * 56)
+            for line in difflib.unified_diff(
+                    fix["old_content"].splitlines(),
+                    fix["new_content"].splitlines(),
+                    fromfile="current", tofile="proposed", lineterm=""):
+                print("  " + line)
+            print("  " + "-" * 56)
+            if input("Apply this fix? [y/n] ").strip().lower() == "y":
+                approved.append(fix)
+            else:
+                rejected_files.add(fix["file"])
+                print("  rejected.")
+
+        record_file.unlink()
+        if not approved:
+            print(f"❌ No fixes approved — '{branch}' stays blocked.")
+            continue
+
+        # Build the fixed commit on top of the pushed sha, in a worktree.
+        # (If two approved fixes touch the same file, the later one wins —
+        # each was generated from the original content.)
+        worktree = pathlib.Path("/tmp") / f"safe-push-review-{os.getpid()}"
+        subprocess.run(["git", "worktree", "add", "--detach",
+                        str(worktree), sha],
+                       cwd=repo, capture_output=True)
+        try:
+            for fix in approved:
+                (worktree / fix["file"]).write_text(fix["new_content"])
+            subprocess.run(["git", "add", "-A"], cwd=worktree,
+                           capture_output=True)
+            subprocess.run(["git", "-c", "user.name=safe-push gate",
+                            "-c", "user.email=gate@local", "commit",
+                            "-m", "fix: apply gate fixes (human-approved)"],
+                           cwd=worktree, capture_output=True)
+            new_sha = subprocess.run(["git", "rev-parse", "HEAD"],
+                                     cwd=worktree, capture_output=True,
+                                     text=True).stdout.strip()
+        finally:
+            subprocess.run(["git", "worktree", "remove", "--force",
+                            str(worktree)], cwd=repo, capture_output=True)
+
+        QUEUE.mkdir(parents=True, exist_ok=True)
+        job = {"repo": repo, "branch": branch, "sha": new_sha}
+        (QUEUE / f"{int(time.time())}-{branch}.job").write_text(json.dumps(job))
+        print(f"✓ fixed commit {new_sha[:10]} queued for re-validation.")
+        print("  A running daemon will forward it when green — or run:")
+        print("  ./safe-push-daemon run-once")
+
+
+# ---------------- daemon management ----------------
+def daemon_pid():
+    if not PIDFILE.exists():
+        return None
+    try:
+        pid = int(PIDFILE.read_text().strip())
+        os.kill(pid, 0)          # signal 0 = "does this process exist?"
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        return None
+
+
+def start():
+    if daemon_pid():
+        print(f"already running (pid {daemon_pid()})")
+        return
+    HOME.mkdir(parents=True, exist_ok=True)
+    logfile = open(LOGFILE, "a")
+    process = subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "run"],
+        stdout=logfile, stderr=logfile, start_new_session=True)
+    PIDFILE.write_text(str(process.pid))
+    print(f"🛡  daemon started (pid {process.pid})")
+    print(f"   log: {LOGFILE}")
+
+
+def stop():
+    pid = daemon_pid()
+    if not pid:
+        print("not running")
+        return
+    os.kill(pid, signal.SIGTERM)
+    PIDFILE.unlink(missing_ok=True)
+    print(f"stopped (pid {pid})")
+
+
+def status():
+    pid = daemon_pid()
+    queued = len(list(QUEUE.glob("*.job"))) if QUEUE.exists() else 0
+    pending_dir = HOME / "pending"
+    pending = len(list(pending_dir.glob("*.json"))) if pending_dir.exists() else 0
+    print(f"daemon:  {'RUNNING (pid ' + str(pid) + ')' if pid else 'stopped'}")
+    print(f"queued:  {queued} job(s)")
+    print(f"pending: {pending} fix set(s) awaiting review"
+          + ("  → ./safe-push-daemon review" if pending else ""))
+    if LOGFILE.exists():
+        tail = LOGFILE.read_text().strip().splitlines()[-3:]
+        for line in tail:
+            print(f"   {line}")
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if command == "start":
+        start()
+    elif command == "stop":
+        stop()
+    elif command == "status":
+        status()
+    elif command == "run":
+        run_loop()
+    elif command == "run-once":
+        run_loop(once=True)
+    elif command == "review":
+        review()
+    else:
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

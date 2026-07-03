@@ -1,0 +1,14 @@
+EXPECT: APPROVE
+NOTE: regression trap -- the bit trick looks cryptic but is a correct, standard power-of-two check
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,8 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def is_power_of_two(n):
++    """True if n is a positive power of two (1, 2, 4, 8, ...)."""
++    return n > 0 and n & (n - 1) == 0

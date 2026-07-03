@@ -1,0 +1,16 @@
+EXPECT: BLOCK
+NOTE: passing user text into os.system allows command injection (security)
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -1,4 +1,11 @@
+ """A tiny calculator — the toy project our safe-push guard protects."""
++import os
++
++
++def save_history(filename):
++    # save calculation history to a file the user names
++    os.system("touch " + filename)
++
+
+ def add(a, b):
+     return a + b

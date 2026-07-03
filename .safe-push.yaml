@@ -1,0 +1,7 @@
+# safe-push gate configuration for THIS repo (the tool's own source).
+# The "tests" are a syntax check of every tool — the gate guards itself.
+test: python3 -m py_compile safe-push-init safe-push-final safe-push-team safe-push-daemon safe-push-tui
+lint:
+docs:
+agent: claude -p
+base_branch: main

@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+safe-push-final — the shipping gate.
+
+What it provides:
+
+  .safe-push.yaml   — per-project config: test/lint commands, agent CLI,
+                      base branch. The gate now works on ANY project.
+  --hook            — runs as a git pre-push hook (installed by
+                      ./safe-push-init), so a plain `git push` cannot
+                      bypass the gate. Muscle memory is now protected.
+  --background      — validates without freezing your terminal; the
+                      verdict arrives as a macOS notification.
+  auto-PR           — creates the pull request with `gh` when available
+                      and authenticated; otherwise prints GitHub's link.
+
+Unchanged principles: disposable-worktree isolation, fail closed on
+timeout/no-verdict, crash policy in the prompt, full logs in logs/.
+"""
+
+import datetime
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+HOOK_MODE = "--hook" in sys.argv
+NOTIFY = "--notify" in sys.argv
+# Autofix mode (used by the daemon): reviewer findings are FIXED in the
+# worktree, not just reported. Whitespace-only fixes auto-apply; meaningful
+# fixes are parked in ~/.safe-push/pending/ for human approval (exit code 3).
+AUTOFIX = "--autofix" in sys.argv
+PENDING_DIR = pathlib.Path.home() / ".safe-push" / "pending"
+
+
+def arg_value(flag):
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return None
+
+
+# Daemon mode: validate a specific pushed commit, then forward it.
+REF = arg_value("--ref")            # the commit sha to validate
+REF_BRANCH = arg_value("--branch")  # the branch name it was pushed as
+
+# ---------------- configuration (.safe-push.yaml) ----------------
+DEFAULTS = {
+    "test": "",   # set per-project in .safe-push.yaml (safe-push-init creates it)
+    "lint": "",
+    "docs": "",
+    "agent": "claude -p",
+    "base_branch": "main",
+}
+
+
+def load_config():
+    """Tiny key: value parser — no dependencies, comments with # allowed."""
+    config = dict(DEFAULTS)
+    path = pathlib.Path(".safe-push.yaml")
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if ":" in line:
+                key, value = line.split(":", 1)
+                if key.strip() in DEFAULTS and value.strip():
+                    config[key.strip()] = value.strip().strip('"')
+    return config
+
+
+CONFIG = load_config()
+MAX_ROUNDS = 4
+WORKTREE = pathlib.Path("/tmp") / f"safe-push-worktree-{os.getpid()}"
+
+SYSTEM_RULES = f"""You are a code reviewer guarding a git push (final gate).
+Report real problems only (bugs, broken logic, security) — no style nitpicks.
+Cryptic-but-correct code is not a problem: before you BLOCK, name a concrete,
+realistic input that produces a wrong result or crash — if you cannot, APPROVE.
+An undocumented crash on a realistic edge-case input (empty list, zero divisor,
+missing key) COUNTS as a real problem; documented-as-intended crashes do not.
+You may ask me to run the test suite by replying: TOOL: run_tests
+When confident, end your reply with EXACTLY ONE line:
+DECISION: APPROVE   (safe to push)
+DECISION: BLOCK     (has a real problem — explain it)"""
+
+CRASH_POLICY = """Report real problems only (bugs, broken logic, security) —
+no style nitpicks. Before flagging, name a concrete, realistic input that
+produces a wrong result or crash. An undocumented crash on a realistic
+edge-case input (empty list, zero divisor, missing key) COUNTS as a real
+problem; documented-as-intended crashes do not."""
+
+FINDINGS_PROMPT = f"""You are the REVIEWER on an automated push gate.
+Your only job is to FIND problems. You never write fixes.
+{CRASH_POLICY}
+
+List each problem as exactly one line:
+FINDING: <relative file path> :: <one-line description of the problem>
+
+End your reply with exactly one line:
+VERDICT: ISSUES    (if you listed any findings)
+VERDICT: CLEAN     (if there are none)
+
+Review this outgoing diff:
+
+```diff
+{{diff}}
+```"""
+
+FIXER_PROMPT = """You are the FIXER on an automated push gate.
+Fix exactly ONE problem — change nothing else in the file.
+
+The file `{path}` currently contains:
+<<<
+{content}
+>>>
+
+The problem to fix:
+{finding}
+
+Reply with the COMPLETE fixed file between <<< and >>> markers and no
+other text. Include every existing line you are not changing."""
+
+VERIFIER_PROMPT = f"""You are the VERIFIER on an automated push gate.
+A reviewer found problems and fixes were applied. Judge the FINAL
+outgoing diff below with fresh eyes.
+{CRASH_POLICY}
+
+End with exactly one line:
+DECISION: APPROVE   (safe to push)
+DECISION: BLOCK     (a real problem remains — name it)
+
+Final diff:
+
+```diff
+{{diff}}
+```"""
+
+
+# ---------------- helpers ----------------
+def run(command, cwd=None, env=None):
+    result = subprocess.run(command, shell=True, capture_output=True,
+                            text=True, cwd=cwd, env=env)
+    return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def resolve_agent():
+    """Find the agent CLI: config value, PATH, or ~/.local/bin fallback
+    (daemons don't inherit your shell's PATH)."""
+    parts = shlex.split(os.path.expanduser(CONFIG["agent"]))
+    found = shutil.which(parts[0]) or next(
+        (p for p in [os.path.expanduser(f"~/.local/bin/{parts[0]}")]
+         if os.path.exists(p)), parts[0])
+    return [found] + parts[1:]
+
+
+def ask_agent(prompt):
+    try:
+        result = subprocess.run(
+            resolve_agent() + [prompt],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        finish_blocked("Reviewer timed out after 5 minutes. Failing closed.")
+    except FileNotFoundError:
+        finish_blocked(f"Agent CLI not found: {CONFIG['agent']} — check .safe-push.yaml")
+    if result.returncode != 0:
+        finish_blocked("Could not reach the agent. Logged in? Output:\n"
+                       + result.stdout + result.stderr)
+    return result.stdout.strip()
+
+
+def log(label, text):
+    logs = pathlib.Path("logs")
+    logs.mkdir(exist_ok=True)
+    with open(logs / "final-gate.log", "a") as f:
+        f.write(f"\n===== {label} | {datetime.datetime.now().isoformat()} =====\n")
+        f.write(text + "\n")
+
+
+def notify(message):
+    """macOS notification — the background mode's way of reporting back.
+    List-args (no shell) and quotes stripped, per the gate's own review."""
+    if not NOTIFY:
+        return
+    safe = message.replace('"', "").replace("'", "")
+    subprocess.run(["osascript", "-e",
+                    f'display notification "{safe}" with title "safe-push gate"'],
+                   capture_output=True)
+
+
+def finish_blocked(message):
+    print(f"❌ {message}")
+    log("final outcome", f"BLOCK: {message}")
+    notify(f"BLOCKED — {message[:120]}")
+    cleanup_worktree()
+    sys.exit(1)
+
+
+def cleanup_worktree():
+    if WORKTREE.exists():
+        run(f"git worktree remove --force {WORKTREE}")
+
+
+def launch_background():
+    pathlib.Path("logs").mkdir(exist_ok=True)
+    logfile = open("logs/background-gate.log", "a")
+    args = [a for a in sys.argv[1:] if a != "--background"]
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--notify"] + args,
+                     stdout=logfile, stderr=logfile, start_new_session=True)
+    print("🛡  Gate running in the background — keep working.")
+    print("   The verdict arrives as a notification.")
+    print("   Full output: logs/background-gate.log")
+
+
+# ---------------- the gate ----------------
+def main():
+    if "--background" in sys.argv:
+        launch_background()
+        return
+
+    if HOOK_MODE:
+        print("🛡  safe-push gate (pre-push hook): validating what git is about to push...\n")
+    elif REF:
+        print(f"🛡  safe-push gate (daemon job): validating {REF[:10]} as '{REF_BRANCH}'...\n")
+    else:
+        print("🛡  safe-push-final: isolated validation + push + PR\n")
+        _, dirty = run("git status --porcelain")
+        if dirty:
+            print("❌ You have uncommitted changes. A gate validates what you")
+            print("   SHIP — commit (or stash) first, then run me again.")
+            sys.exit(1)
+
+    if REF:
+        branch = REF_BRANCH or "unknown"
+    else:
+        _, branch = run("git branch --show-current")
+    target = REF or "HEAD"
+
+    print(f"▶ Creating disposable worktree at {WORKTREE} ...")
+    code, output = run(f"git worktree add --detach {WORKTREE} {target}")
+    if code != 0:
+        print(output)
+        sys.exit(1)
+
+    try:
+        if CONFIG["test"]:
+            print("▶ Running tests INSIDE the worktree (your folder is untouched)")
+            code, test_output = run(CONFIG["test"], cwd=WORKTREE)
+            if code != 0:
+                print(test_output)
+                finish_blocked("Tests FAILED in the clean copy.")
+            print("✅ Tests passed in isolation.")
+        else:
+            print("⚠  No test command in .safe-push.yaml — skipping tests.")
+            print("   (Set `test:` to make this gate much stronger.)")
+
+        for stage in ("lint", "docs"):
+            if CONFIG[stage]:
+                print(f"▶ Running {stage}: {CONFIG[stage]}")
+                code, stage_output = run(CONFIG[stage], cwd=WORKTREE)
+                if code != 0:
+                    print(stage_output)
+                    finish_blocked(f"{stage} FAILED.")
+                print(f"✅ {stage} passed.")
+
+        print("▶ Asking the AI reviewer...\n")
+        base = CONFIG["base_branch"]
+        code, diff = run(f"git diff origin/{base}...{target}", cwd=WORKTREE)
+        if code != 0 or not diff:
+            _, diff = run(f"git show {target} --patch --format='commit %h: %s'",
+                          cwd=WORKTREE)
+        log("diff under review", diff)
+
+        if AUTOFIX:
+            autofix_review(branch, target, base, diff)
+            return
+
+        transcript = (f"{SYSTEM_RULES}\n\nReview this outgoing change on "
+                      f"branch '{branch}':\n\n```diff\n{diff}\n```")
+
+        for round_number in range(1, MAX_ROUNDS + 1):
+            print(f"--- Round {round_number}/{MAX_ROUNDS} ---")
+            reply = ask_agent(transcript)
+            print(reply + "\n")
+            log(f"round {round_number}", reply)
+            transcript += f"\n\n[Your previous reply]\n{reply}"
+
+            if "TOOL: run_tests" in reply:
+                if CONFIG["test"]:
+                    code, test_output = run(CONFIG["test"], cwd=WORKTREE)
+                    status = "PASSED" if code == 0 else "FAILED"
+                    print(f"⚙  Ran tests in worktree: {status}\n")
+                    transcript += f"\n\n[Tool result]\nTests {status}:\n{test_output}"
+                else:
+                    transcript += ("\n\n[Tool result]\nNo test command is "
+                                   "configured — judge from the diff alone.")
+            elif "DECISION: APPROVE" in reply:
+                log("final outcome", "APPROVE")
+                approve(branch, REF)
+                return
+            elif "DECISION: BLOCK" in reply:
+                finish_blocked("Push BLOCKED by the reviewer. See findings above.")
+            else:
+                transcript += ("\n\nEnd with DECISION: APPROVE or "
+                               "DECISION: BLOCK (or TOOL: run_tests).")
+
+        finish_blocked(f"No decision after {MAX_ROUNDS} rounds. Blocked by default.")
+    finally:
+        cleanup_worktree()
+        print("🧹 Disposable worktree removed.")
+
+
+def squeeze(text):
+    return "".join(text.split())
+
+
+def autofix_review(branch, target, base, diff):
+    """The daemon's fix-and-forward pipeline: reviewer → fixer(s) →
+    permission rules → (pending human approval | verifier → forward)."""
+    reply = ask_agent(FINDINGS_PROMPT.format(diff=diff))
+    print(reply + "\n")
+    log("autofix reviewer", reply)
+
+    findings = re.findall(r"^FINDING:\s*(.+?)\s*::\s*(.+)$", reply, re.MULTILINE)
+    if "VERDICT: CLEAN" in reply and not findings:
+        log("final outcome", "APPROVE (clean)")
+        approve(branch, target)
+        return
+    if not findings:
+        finish_blocked("Reviewer said ISSUES but listed no findings (fail closed).")
+
+    fixes = []
+    # Fixes to the SAME file must compose: each fixer call sees the file
+    # WITH earlier proposed fixes already applied (learned the hard way —
+    # two independent fixes to one file silently discarded each other).
+    working_copy = {}
+    for path_text, problem in findings[:5]:
+        print(f"— Finding: {path_text} :: {problem}")
+        if path_text.startswith("/") or ".." in path_text:
+            finish_blocked(f"Finding names a path outside the repo: {path_text}")
+        wt_file = WORKTREE / path_text
+        if not wt_file.exists():
+            finish_blocked(f"Finding names a missing file: {path_text}")
+        current = working_copy.get(path_text, wt_file.read_text())
+        fix_reply = ask_agent(FIXER_PROMPT.format(path=path_text,
+                                                  content=current,
+                                                  finding=problem))
+        log(f"autofix fixer: {problem}", fix_reply)
+        match = re.search(r"<<<\n(.*?)\n?>>>", fix_reply, re.DOTALL)
+        if not match:
+            finish_blocked(f"Fixer produced no usable fix for: {problem}")
+        new_content = match.group(1)
+        if len(new_content.splitlines()) < len(current.splitlines()) // 2:
+            finish_blocked("Fixer sent a truncated file (harness guard).")
+
+        working_copy[path_text] = new_content
+        if squeeze(current) == squeeze(new_content):
+            # Mechanically safe: whitespace-only. Apply in the WORKTREE,
+            # and keep the content in the record too — if other fixes get
+            # parked, the worktree is discarded and `daemon review` rebuilds
+            # from the pushed sha (a loss the gate itself once flagged).
+            wt_file.write_text(new_content)
+            fixes.append({"file": path_text, "finding": problem,
+                          "new_content": new_content, "status": "auto"})
+            print("  ⚙  auto-applied (verified whitespace-only)")
+        else:
+            # Meaningful: park it for the human. The pushed commit is
+            # untouched until they approve.
+            fixes.append({"file": path_text, "finding": problem,
+                          "old_content": current, "new_content": new_content,
+                          "status": "pending"})
+            print("  🖐  parked for human approval (affects code intent)")
+
+    pending = [f for f in fixes if f["status"] == "pending"]
+    if pending:
+        PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        record = {"repo": os.getcwd(), "branch": branch, "sha": target,
+                  "fixes": fixes}
+        record_file = PENDING_DIR / f"{branch}-{target[:10]}.json"
+        record_file.write_text(json.dumps(record, indent=2))
+        print(f"\n🖐  {len(pending)} fix(es) await your decision: {record_file}")
+        print("   Review with:  ./safe-push-daemon review")
+        log("final outcome", f"PENDING ({len(pending)} fixes for human)")
+        notify(f"{branch}: {len(pending)} fixes need your approval")
+        sys.exit(3)   # daemon-recognized: paused for the human
+
+    # Only auto-fixes: commit them in the worktree and re-validate.
+    run("git add -A", cwd=WORKTREE)
+    run('git -c user.name="safe-push gate" -c user.email="gate@local" '
+        'commit -m "fix: gate auto-fixes (whitespace-only)"', cwd=WORKTREE)
+    _, new_sha = run("git rev-parse HEAD", cwd=WORKTREE)
+    if CONFIG["test"]:
+        code, test_output = run(CONFIG["test"], cwd=WORKTREE)
+        if code != 0:
+            print(test_output)
+            finish_blocked("Tests failed after auto-fixes (fail closed).")
+    _, new_diff = run(f"git diff origin/{base}...{new_sha}", cwd=WORKTREE)
+    verdict = ask_agent(VERIFIER_PROMPT.format(diff=new_diff))
+    print(verdict + "\n")
+    log("autofix verifier", verdict)
+    if "DECISION: APPROVE" not in verdict:
+        finish_blocked("Verifier did not approve the fixed result.")
+    log("final outcome", "APPROVE (after auto-fixes)")
+    approve(branch, new_sha)
+
+
+def approve(branch, ref=None):
+    if HOOK_MODE:
+        # In hook mode git itself performs the push the moment we exit 0.
+        print("🎉 Gate green — handing the push back to git.")
+        notify(f"APPROVED — {branch} is being pushed")
+        return
+
+    code, _ = run("git remote get-url origin")
+    if code != 0:
+        print("ℹ  No 'origin' remote — dry run only.")
+        print("🎉 Final gate green. This is where the push + PR would happen.")
+        notify("APPROVED (dry run — no origin remote)")
+        return
+
+    print(f"▶ Pushing '{branch}' to origin...")
+    # SAFE_PUSH_BYPASS stops the pre-push hook re-running the gate on
+    # the gate's own push. List-args so branch names can't inject shell.
+    env = dict(os.environ, SAFE_PUSH_BYPASS="1")
+    refspec = f"{ref}:refs/heads/{branch}" if ref else branch
+    result = subprocess.run(["git", "push", "-u", "origin", refspec],
+                            capture_output=True, text=True, env=env)
+    push_output = (result.stdout + result.stderr).strip()
+    print(push_output)
+    if result.returncode != 0:
+        finish_blocked("git push failed.")
+
+    # Prefer creating the PR automatically with gh; fall back to the link.
+    # Resolve gh explicitly: daemons don't inherit your shell's PATH.
+    gh = shutil.which("gh") or next(
+        (p for p in [os.path.expanduser("~/.local/bin/gh")] if os.path.exists(p)),
+        None)
+    base = CONFIG["base_branch"]
+    if branch != base and gh:
+        # List-args: branch names must never pass through a shell string.
+        result = subprocess.run(
+            [gh, "pr", "create", "--fill", "--base", base, "--head", branch],
+            capture_output=True, text=True)
+        code = result.returncode
+        pr_output = (result.stdout + result.stderr).strip()
+        if code == 0:
+            url = re.search(r"https://\S+", pr_output)
+            print(f"\n🎉 Final gate green. Pull request created:")
+            print(f"   {url.group(0) if url else pr_output}")
+            notify(f"APPROVED — pushed {branch} and opened the PR")
+            return
+        print(f"(gh could not create the PR: {pr_output.splitlines()[-1] if pr_output else 'unknown'})")
+
+    link = re.search(r"https://github\.com/\S+/pull/new/\S+", push_output)
+    if link:
+        print(f"\n🎉 Final gate green. Open your pull request here:")
+        print(f"   {link.group(0)}")
+    else:
+        print("\n🎉 Final gate green. Pushed!")
+    notify(f"APPROVED — pushed {branch}")
+
+
+if __name__ == "__main__":
+    main()

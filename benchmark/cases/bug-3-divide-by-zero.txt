@@ -1,0 +1,13 @@
+EXPECT: BLOCK
+NOTE: crashes when count is 0; codebase convention guards this explicitly
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,7 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def per_unit(total, count):
++    return total / count

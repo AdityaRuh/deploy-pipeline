@@ -1,0 +1,14 @@
+EXPECT: APPROVE
+NOTE: adds test coverage only -- strictly an improvement
+--- a/practice-app/test_calculator.py
++++ b/practice-app/test_calculator.py
+@@ -16,6 +16,9 @@
+     def test_divide(self):
+         self.assertEqual(calculator.divide(10, 2), 5)
+
++    def test_divide_negative(self):
++        self.assertEqual(calculator.divide(-10, 2), -5)
++
+     def test_divide_by_zero_is_rejected(self):
+         with self.assertRaises(ValueError):
+             calculator.divide(1, 0)

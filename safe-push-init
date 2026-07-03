@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+safe-push-init — one-time setup that arms the gate on a repository.
+
+1. Creates .safe-push.yaml (the gate's per-project config) if missing.
+2. Installs a git pre-push hook: a plain `git push` runs the gate
+   synchronously (blocking, but impossible to forget).
+3. Creates a local GATE REPOSITORY (~/.safe-push/repos/<name>.git) and
+   registers it as the remote `gate`. Pushing to it returns INSTANTLY —
+   the push lands locally, a job is queued, and safe-push-daemon
+   validates it in the background and forwards it to origin when green.
+   Push and keep working — the daemon reports back with a notification.
+
+Escape hatch (emergencies only): SAFE_PUSH_BYPASS=1 git push ...
+"""
+
+import pathlib
+import stat
+import subprocess
+import sys
+
+SAFE_PUSH_HOME = pathlib.Path.home() / ".safe-push"
+QUEUE = SAFE_PUSH_HOME / "queue"
+
+CONFIG_TEMPLATE = """# safe-push gate configuration (read by safe-push-final)
+# How to run THIS project's tests (must exit non-zero on failure).
+# Examples:  npm test   |   python3 -m pytest   |   go test ./...
+# Strongly recommended — without it the gate relies on AI review alone.
+test:
+# Optional lint command (leave empty to skip), e.g.  lint: make lint
+lint:
+# Optional docs check command (leave empty to skip)
+docs:
+# The AI agent CLI used for review — swap for another agent if you like.
+agent: claude -p
+# The branch pull requests are compared against.
+base_branch: main
+"""
+
+PRE_PUSH_HOOK = """#!/bin/bash
+# Installed by safe-push-init — validates every push before it leaves
+# this machine. Emergencies only: SAFE_PUSH_BYPASS=1 git push ...
+if [ "$SAFE_PUSH_BYPASS" = "1" ]; then exit 0; fi
+# Pushes to the local gate remote are validated by the daemon instead.
+if [ "$1" = "gate" ]; then exit 0; fi
+GATE="$(command -v safe-push-final || true)"
+[ -x "$GATE" ] || GATE="$HOME/.local/bin/safe-push-final"
+if [ ! -x "$GATE" ]; then
+    echo "safe-push hook: safe-push-final not installed — allowing push."
+    exit 0
+fi
+exec "$GATE" --hook
+"""
+
+
+def make_executable(path):
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def install_config():
+    config = pathlib.Path(".safe-push.yaml")
+    if config.exists():
+        print("✓ .safe-push.yaml already exists — leaving it untouched")
+    else:
+        config.write_text(CONFIG_TEMPLATE)
+        print("✓ created .safe-push.yaml — edit it to fit this project")
+
+
+def install_pre_push_hook(hooks_dir):
+    hook_path = hooks_dir / "pre-push"
+    if hook_path.exists() and "safe-push" not in hook_path.read_text():
+        print(f"⚠  {hook_path} exists and isn't ours — NOT overwriting.")
+        print("   Add this line to it yourself:  exec ./safe-push-final --hook")
+        return
+    hook_path.write_text(PRE_PUSH_HOOK)
+    make_executable(hook_path)
+    print(f"✓ installed pre-push hook: {hook_path}")
+
+
+def install_gate_remote():
+    """A local bare repository = the gate. Pushing to it is instant and
+    local; its post-receive hook queues the branch for the daemon."""
+    repo_path = pathlib.Path.cwd()
+    gate_repo = SAFE_PUSH_HOME / "repos" / f"{repo_path.name}.git"
+    QUEUE.mkdir(parents=True, exist_ok=True)
+
+    if not gate_repo.exists():
+        gate_repo.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "--bare", "-q", str(gate_repo)], check=True)
+        print(f"✓ created gate repository: {gate_repo}")
+    else:
+        print(f"✓ gate repository already exists: {gate_repo}")
+
+    hook = gate_repo / "hooks" / "post-receive"
+    hook.write_text(f"""#!/bin/bash
+# Queues every pushed branch for validation by safe-push-daemon.
+while read old new ref; do
+  # Branch deletion pushes an all-zeros sha — nothing to validate.
+  if [ "$new" = "0000000000000000000000000000000000000000" ]; then
+    echo "gate: branch deletion — nothing to validate."
+    continue
+  fi
+  branch="${{ref#refs/heads/}}"
+  # Branch names may contain slashes (feature/x) — flatten for the filename.
+  safe_name="${{branch//\\//-}}"
+  job="{QUEUE}/$(date +%s)-$$-$safe_name.job"
+  printf '{{"repo": "%s", "branch": "%s", "sha": "%s"}}\\n' \\
+      "{repo_path}" "$branch" "$new" > "$job"
+  echo "gate: '$branch' queued — the daemon will validate and forward it."
+done
+""")
+    make_executable(hook)
+
+    result = subprocess.run(["git", "remote", "get-url", "gate"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        subprocess.run(["git", "remote", "add", "gate", str(gate_repo)])
+        print("✓ registered remote 'gate'")
+    else:
+        subprocess.run(["git", "remote", "set-url", "gate", str(gate_repo)])
+        print("✓ remote 'gate' already registered")
+
+
+def main():
+    result = subprocess.run(["git", "rev-parse", "--git-path", "hooks"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        print("❌ Not a git repository.")
+        sys.exit(1)
+    hooks_dir = pathlib.Path(result.stdout.strip())
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    install_config()
+    install_pre_push_hook(hooks_dir)
+    install_gate_remote()
+
+    print()
+    print("🛡  Gate armed. Two ways to ship from this repo:")
+    print("   git push origin ...     → gate validates FIRST (blocking), then push")
+    print("   git push gate <branch>  → returns instantly; safe-push-daemon")
+    print("                             validates in the background and forwards")
+    print("                             to origin + opens the PR when green")
+    print()
+    print("   daemon:   safe-push-daemon start | status | stop")
+    print("   full UI:  safe-push-tui")
+    print("   bypass:   SAFE_PUSH_BYPASS=1 git push   (emergencies only)")
+
+
+if __name__ == "__main__":
+    main()

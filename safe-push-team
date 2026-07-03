@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""
+safe-push-team — interactive pre-commit review with a three-agent split.
+
+One agent doing two jobs has blurred judgment: a reviewer who also fixes
+starts approving its own homework. So we split the roles:
+
+  REVIEWER — finds problems. Never writes fixes. Small, fresh context.
+  FIXER    — fixes exactly ONE finding. Sees only the file + that finding,
+             never the review conversation. (a "context firewall")
+  VERIFIER — fresh reviewer eyes on the FINAL diff. It judges the result,
+             not the process, so it can't be biased by how hard fixing was.
+
+Safety is still enforced by code, not trust (same as safe-push-pro):
+whitespace-only fixes auto-apply; meaningful fixes need the human's y/n;
+truncated files are rejected; every applied fix is re-tested, and a fix
+that breaks the tests is mechanically ROLLED BACK.
+"""
+
+import datetime
+import difflib
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+MAX_FINDINGS = 5
+
+# ---------------- configuration (.safe-push.yaml, same as safe-push-final) --
+DEFAULTS = {"test": "", "agent": "claude -p"}
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    path = pathlib.Path(".safe-push.yaml")
+    if path.exists():
+        for line in path.read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if ":" in line:
+                key, value = line.split(":", 1)
+                if key.strip() in DEFAULTS and value.strip():
+                    config[key.strip()] = value.strip().strip('"')
+    return config
+
+
+CONFIG = load_config()
+TEST_COMMAND = CONFIG["test"]
+
+
+def resolve_agent():
+    parts = shlex.split(os.path.expanduser(CONFIG["agent"]))
+    found = shutil.which(parts[0]) or next(
+        (p for p in [os.path.expanduser(f"~/.local/bin/{parts[0]}")]
+         if os.path.exists(p)), parts[0])
+    return [found] + parts[1:]
+
+CRASH_POLICY = """Report real problems only (bugs, broken logic, security) —
+no style nitpicks. Before flagging, name a concrete, realistic input that
+produces a wrong result or crash. An undocumented crash on a realistic
+edge-case input (empty list, zero divisor, missing key) COUNTS as a real
+problem; documented-as-intended crashes do not."""
+
+REVIEWER_PROMPT = f"""You are the REVIEWER on a two-agent code gate.
+Your only job is to FIND problems. You never write fixes.
+{CRASH_POLICY}
+
+List each problem as exactly one line:
+FINDING: <relative file path> :: <one-line description of the problem>
+
+End your reply with exactly one line:
+VERDICT: ISSUES    (if you listed any findings)
+VERDICT: CLEAN     (if there are none)
+
+Review this outgoing diff:
+
+```diff
+{{diff}}
+```"""
+
+FIXER_PROMPT = """You are the FIXER on a two-agent code gate.
+Fix exactly ONE problem — change nothing else in the file.
+
+The file `{path}` currently contains:
+<<<
+{content}
+>>>
+
+The problem to fix:
+{finding}
+
+Reply with the COMPLETE fixed file between <<< and >>> markers and no
+other text. Include every existing line you are not changing."""
+
+VERIFIER_PROMPT = f"""You are the VERIFIER on a two-agent code gate.
+A reviewer found problems and a fixer addressed them; the humans approved.
+Judge the FINAL outgoing diff below with fresh eyes.
+{CRASH_POLICY}
+
+End with exactly one line:
+DECISION: APPROVE   (safe to push)
+DECISION: BLOCK     (a real problem remains — name it)
+
+Final diff:
+
+```diff
+{{diff}}
+```"""
+
+
+# ---------------- helpers (same battle-tested pieces as safe-push-pro) ----
+def run(command):
+    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def run_tests():
+    if not TEST_COMMAND:
+        return True, "no test command configured in .safe-push.yaml"
+    code, output = run(TEST_COMMAND)
+    return code == 0, output
+
+
+def ask_claude(prompt, label):
+    print(f"🤖 [{label}] thinking...")
+    try:
+        result = subprocess.run(resolve_agent() + [prompt],
+                                capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        print(f"❌ {label} timed out after 5 minutes. Failing closed (BLOCK).")
+        sys.exit(1)
+    if result.returncode != 0:
+        print("❌ Could not reach Claude. Are you logged in? Run: claude")
+        sys.exit(1)
+    return result.stdout.strip()
+
+
+def log(label, text):
+    logs = pathlib.Path("logs")
+    logs.mkdir(exist_ok=True)
+    with open(logs / "team-gate.log", "a") as f:
+        f.write(f"\n===== {label} | {datetime.datetime.now().isoformat()} =====\n")
+        f.write(text + "\n")
+
+
+def get_diff():
+    code, _ = run("git rev-parse HEAD")
+    if code != 0:
+        print("ℹ  No commits yet. Commit first, then run me again.")
+        sys.exit(1)
+    code, diff = run("git diff HEAD")
+    if code == 0 and diff:
+        return diff
+    code, diff = run("git show HEAD --patch --format='commit %h: %s'")
+    return diff if code == 0 else ""
+
+
+def squeeze(text):
+    return "".join(text.split())
+
+
+def apply_with_permission_gate(path_text, new_content):
+    """Returns True if the fix ended up applied (and tests still pass)."""
+    if path_text.startswith("/") or ".." in path_text:
+        print("⚙  FIX REJECTED: path outside the repo.")
+        return False
+    path = pathlib.Path(path_text)
+    if not path.exists():
+        print("⚙  FIX REJECTED: file does not exist.")
+        return False
+    old_content = path.read_text()
+
+    if len(new_content.splitlines()) < len(old_content.splitlines()) // 2:
+        print("⚙  FIX REJECTED by harness: looks TRUNCATED.")
+        return False
+
+    if squeeze(old_content) == squeeze(new_content):
+        path.write_text(new_content)
+        print("⚙  Auto-applied (verified whitespace-only).")
+    else:
+        print("\n" + "=" * 60)
+        print(f"🖐  The fixer wants to change {path_text}:")
+        print("=" * 60)
+        for line in difflib.unified_diff(old_content.splitlines(),
+                                         new_content.splitlines(),
+                                         fromfile="current", tofile="proposed",
+                                         lineterm=""):
+            print(line)
+        print("=" * 60)
+        if input("Apply this fix? [y/n] ").strip().lower() != "y":
+            print("⚙  Fix rejected by human.")
+            return False
+        path.write_text(new_content)
+
+    # Sensor after actuator — and mechanical ROLLBACK if the fix breaks tests.
+    passed, _ = run_tests()
+    if not passed:
+        path.write_text(old_content)
+        print("⚙  Fix BROKE the tests → rolled back automatically.")
+        return False
+    print("⚙  Tests still pass after the fix.")
+    return True
+
+
+# ---------------- the pipeline: reviewer -> fixer(s) -> verifier ----------
+def main():
+    print("🛡  safe-push-team: reviewer + fixer + verifier\n")
+
+    passed, test_output = run_tests()
+    if not passed:
+        print(test_output)
+        print("\n❌ Tests FAILED before review even started. BLOCKED.")
+        sys.exit(1)
+    print("✅ Tests pass. Stage 1: the REVIEWER looks for problems...\n")
+
+    diff = get_diff()
+    if not diff:
+        print("ℹ  Nothing to review.")
+        sys.exit(0)
+
+    review = ask_claude(REVIEWER_PROMPT.format(diff=diff), "reviewer")
+    print(review + "\n")
+    log("reviewer", review)
+
+    findings = re.findall(r"^FINDING:\s*(.+?)\s*::\s*(.+)$", review, re.MULTILINE)
+    if "VERDICT: CLEAN" in review and not findings:
+        print("🎉 Reviewer found nothing. Gate green (dry run — use "
+              "safe-push-final to actually ship).")
+        return
+    if not findings:
+        print("❌ Reviewer said ISSUES but listed no findings. BLOCKED (fail closed).")
+        sys.exit(1)
+
+    print(f"▶ Stage 2: the FIXER handles {len(findings)} finding(s), one at a time.\n")
+    all_fixed = True
+    for path_text, problem in findings[:MAX_FINDINGS]:
+        print(f"— Finding: {path_text} :: {problem}")
+        file_path = pathlib.Path(path_text)
+        if not file_path.exists():
+            print("⚙  Skipped: file not found.\n")
+            all_fixed = False
+            continue
+        # The context firewall: the fixer sees ONLY this file + this finding.
+        fix_reply = ask_claude(
+            FIXER_PROMPT.format(path=path_text,
+                                content=file_path.read_text(),
+                                finding=problem),
+            "fixer")
+        log(f"fixer: {problem}", fix_reply)
+        match = re.search(r"<<<\n(.*?)\n?>>>", fix_reply, re.DOTALL)
+        if not match:
+            print("⚙  Fixer sent no usable file. Finding stays unfixed.\n")
+            all_fixed = False
+            continue
+        if not apply_with_permission_gate(path_text, match.group(1)):
+            all_fixed = False
+        print()
+
+    if not all_fixed:
+        print("❌ Not every finding was resolved. BLOCKED (fail closed).")
+        sys.exit(1)
+
+    print("▶ Stage 3: the VERIFIER re-judges the final result with fresh eyes.\n")
+    final_diff = get_diff()
+    verdict = ask_claude(VERIFIER_PROMPT.format(diff=final_diff), "verifier")
+    print(verdict + "\n")
+    log("verifier", verdict)
+
+    if "DECISION: APPROVE" in verdict:
+        run("git add -A")
+        run('git commit -m "fix: apply team-gate fixes (reviewer+fixer+verifier)"')
+        print("🎉 Team gate green — fixes committed. (Dry run: use "
+              "safe-push-final to actually ship.)")
+    else:
+        print("❌ VERIFIER blocked the result. See its findings above.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

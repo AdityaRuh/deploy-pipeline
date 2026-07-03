@@ -1,0 +1,13 @@
+EXPECT: APPROVE
+NOTE: documentation-only change, no behavior difference
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -4,6 +4,7 @@
+ def add(a, b):
++    """Return the sum of a and b."""
+     return a + b
+
+
+ def subtract(a, b):
++    """Return a minus b."""
+     return a - b

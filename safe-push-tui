@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+safe-push-tui — the interactive dashboard (pure stdlib curses).
+
+Arrow keys to move, Enter to select, q to quit. When a gate asks
+"Apply this fix? [y/n]", answer with the y/n keys right in the UI —
+the TUI passes your answer through to the running gate.
+"""
+
+import curses
+import os
+import pathlib
+import subprocess
+
+MENU = [
+    ("Run team gate      (review + fix + verify)", ["safe-push-team"]),
+    ("Run final gate     (validate + push + PR)", ["safe-push-final"]),
+    ("Final gate in background (notification)", ["safe-push-final", "--background"]),
+    ("Daemon: status", ["safe-push-daemon", "status"]),
+    ("Daemon: start", ["safe-push-daemon", "start"]),
+    ("Daemon: stop", ["safe-push-daemon", "stop"]),
+    ("Review parked fixes (approve/reject)", ["safe-push-daemon", "review"]),
+    ("View latest gate log", None),   # handled specially
+    ("Quit", None),
+]
+
+
+def draw_menu(stdscr, selected):
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    stdscr.addstr(0, 2, "🛡  safe-push — nothing ships until every check is green",
+                  curses.A_BOLD)
+    stdscr.addstr(1, 2, "↑/↓ move · Enter select · q quit")
+    for index, (label, _) in enumerate(MENU):
+        style = curses.A_REVERSE if index == selected else curses.A_NORMAL
+        stdscr.addstr(3 + index, 4, label[: width - 6], style)
+    stdscr.refresh()
+
+
+def run_command(stdscr, command):
+    """Stream a command's output into the screen; pass y/n prompts through."""
+    curses.curs_set(0)
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    stdscr.addstr(0, 2, "running: " + " ".join(command), curses.A_BOLD)
+    stdscr.refresh()
+
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    process = subprocess.Popen(command, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT,
+                               text=True, env=env)
+    lines = [""]
+
+    def redraw(prompting=False):
+        stdscr.erase()
+        stdscr.addstr(0, 2, "running: " + " ".join(command), curses.A_BOLD)
+        visible = lines[-(height - 3):]
+        for row, line in enumerate(visible):
+            try:
+                stdscr.addstr(2 + row, 0, line[: width - 1])
+            except curses.error:
+                pass
+        if prompting:
+            try:
+                stdscr.addstr(height - 1, 0,
+                              "gate is asking — press y or n",
+                              curses.A_REVERSE)
+            except curses.error:
+                pass
+        stdscr.refresh()
+
+    while True:
+        char = process.stdout.read(1)
+        if char == "":
+            break
+        if char == "\n":
+            lines.append("")
+        else:
+            lines[-1] += char
+        # The permission gate's escalation prompt — answer inside the TUI.
+        if lines[-1].endswith("[y/n] "):
+            redraw(prompting=True)
+            answer = ""
+            while answer not in ("y", "n"):
+                key = stdscr.getkey()
+                answer = key.lower() if isinstance(key, str) else ""
+            process.stdin.write(answer + "\n")
+            process.stdin.flush()
+            lines[-1] += answer
+            lines.append("")
+        if char == "\n":
+            redraw()
+
+    process.wait()
+    verdict = "✅ finished (exit 0)" if process.returncode == 0 \
+        else f"❌ finished (exit {process.returncode})"
+    lines.append(verdict)
+    lines.append("press any key to return to the menu")
+    redraw()
+    stdscr.getch()
+
+
+def view_latest_log(stdscr):
+    logs = sorted(pathlib.Path("logs").glob("*.log"),
+                  key=lambda p: p.stat().st_mtime) if pathlib.Path("logs").exists() else []
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    if not logs:
+        stdscr.addstr(2, 2, "no logs yet — run a gate first")
+    else:
+        latest = logs[-1]
+        stdscr.addstr(0, 2, f"latest log: {latest}", curses.A_BOLD)
+        for row, line in enumerate(latest.read_text().splitlines()[-(height - 3):]):
+            try:
+                stdscr.addstr(2 + row, 0, line[: width - 1])
+            except curses.error:
+                pass
+    stdscr.addstr(height - 1, 0, "press any key to return", curses.A_REVERSE)
+    stdscr.refresh()
+    stdscr.getch()
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    selected = 0
+    while True:
+        draw_menu(stdscr, selected)
+        key = stdscr.getch()
+        if key in (ord("q"), ord("Q")):
+            return
+        if key == curses.KEY_UP:
+            selected = (selected - 1) % len(MENU)
+        elif key == curses.KEY_DOWN:
+            selected = (selected + 1) % len(MENU)
+        elif key in (curses.KEY_ENTER, 10, 13):
+            label, command = MENU[selected]
+            if label == "Quit":
+                return
+            if label.startswith("View latest"):
+                view_latest_log(stdscr)
+            else:
+                run_command(stdscr, command)
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)

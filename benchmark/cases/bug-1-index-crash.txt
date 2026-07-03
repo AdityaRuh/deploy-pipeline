@@ -1,0 +1,13 @@
+EXPECT: BLOCK
+NOTE: items[len(items)] is always one past the end -> IndexError every call
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,7 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def last_item(items):
++    return items[len(items)]

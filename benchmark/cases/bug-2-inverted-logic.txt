@@ -1,0 +1,13 @@
+EXPECT: BLOCK
+NOTE: returns True for ODD numbers -- the logic is inverted
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,7 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def is_even(n):
++    return n % 2 == 1

@@ -1,0 +1,17 @@
+EXPECT: APPROVE
+NOTE: regression trap -- no zero-guard LOOKS like the codebase-convention bug, but the docstring says it is intentional and documented
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,11 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def strict_ratio(a, b):
++    """Return a / b with NO zero-guard, on purpose.
++
++    Callers use this where b == 0 is a programmer error that must crash
++    loudly and immediately (decided in issue #12). Do not add a guard."""
++    return a / b

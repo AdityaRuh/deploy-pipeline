@@ -1,0 +1,15 @@
+EXPECT: BLOCK
+NOTE: history=[] is created ONCE -- every call without history shares the same list (classic Python trap)
+--- a/practice-app/calculator.py
++++ b/practice-app/calculator.py
+@@ -20,3 +20,9 @@
+ def percentage(part, whole):
+     if whole == 0:
+         raise ValueError("Cannot take a percentage of zero")
+     return part / whole * 100
++
++
++def record_result(result, history=[]):
++    """Append a result to a history list and return it."""
++    history.append(result)
++    return history

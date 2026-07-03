@@ -1,0 +1,46 @@
+EXPECT: BLOCK
+NOTE: one buried bug in a big clean diff -- mean() starts the loop at index 1, silently skipping the first score
+--- /dev/null
++++ b/practice-app/stats.py
+@@ -0,0 +1,44 @@
++"""Statistics helpers for the calculator app."""
++
++
++def mean(scores):
++    """Average of a list of scores."""
++    if not scores:
++        raise ValueError("Cannot average an empty list")
++    total = 0
++    for i in range(1, len(scores)):
++        total += scores[i]
++    return total / len(scores)
++
++
++def median(scores):
++    """Middle value of a sorted copy of the scores."""
++    if not scores:
++        raise ValueError("Cannot take the median of an empty list")
++    ordered = sorted(scores)
++    middle = len(ordered) // 2
++    if len(ordered) % 2 == 1:
++        return ordered[middle]
++    return (ordered[middle - 1] + ordered[middle]) / 2
++
++
++def spread(scores):
++    """Difference between the highest and lowest score."""
++    if not scores:
++        raise ValueError("Cannot take the spread of an empty list")
++    return max(scores) - min(scores)
++
++
++def top_n(scores, n):
++    """The n highest scores, best first."""
++    if n < 0:
++        raise ValueError("n must not be negative")
++    return sorted(scores, reverse=True)[:n]
++
++
++def passing(scores, threshold):
++    """All scores at or above the threshold, in original order."""
++    return [s for s in scores if s >= threshold]
